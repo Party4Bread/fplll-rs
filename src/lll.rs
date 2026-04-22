@@ -42,6 +42,10 @@ pub struct LllReduction<'a> {
     pub final_kappa: usize,
     pub zeros: usize,
     pub n_swaps: u64,
+    /// Reusable scratch buffer: stored mu row for babai inner loop.
+    scratch_mu: Vec<f64>,
+    /// Reusable scratch buffer: exponent per mu slot.
+    scratch_expo: Vec<i64>,
 }
 
 impl<'a> LllReduction<'a> {
@@ -51,56 +55,119 @@ impl<'a> LllReduction<'a> {
         let early_red = (flags & EARLY_RED) != 0;
         let verbose = (flags & VERBOSE) != 0;
         let swap_threshold = if siegel { delta - eta * eta } else { delta };
+        let d = gso.d;
         LllReduction {
             gso, delta, eta, swap_threshold, siegel, early_red, verbose,
             status: RedStatus::Success, final_kappa: 0, zeros: 0, n_swaps: 0,
+            scratch_mu: vec![0.0; d],
+            scratch_expo: vec![0i64; d],
         }
     }
 
     /// Babai size reduction: ensure |mu_true(kappa, j)| <= eta for j in [start, end).
+    ///
+    /// Fast path: maintains μ, r of row `kappa` incrementally using the closed-form
+    /// updates (see `MatGso::patch_row_addmul`) rather than recomputing them from
+    /// an expensive integer gram. Fallback to invalidate+regram when q doesn't fit f64.
     fn babai(&mut self, kappa: usize, end: usize, start: usize) -> bool {
-        for _iter in 0..128 {
+        if self.scratch_mu.len() < end { self.scratch_mu.resize(end, 0.0); }
+        if self.scratch_expo.len() < end { self.scratch_expo.resize(end, 0); }
+
+        // On entry, gso.mu[kappa][*] may be stale (e.g. after an external row op by
+        // BKZ or a swap that invalidated this row). If so, regram before reading.
+        if self.gso.gso_valid_cols[kappa] <= kappa {
             if !self.gso.update_gso_row(kappa, end.saturating_sub(1)) {
                 self.status = RedStatus::GsoFailure; return false;
             }
+        }
 
+        // Ensure row kappa's GSO is fresh on entry (caller expects it to be stale or fresh).
+        if !self.gso.update_gso_row(kappa, end.saturating_sub(1)) {
+            self.status = RedStatus::GsoFailure; return false;
+        }
+
+        let mut need_regram = false;
+        for _iter in 0..128 {
+            if need_regram {
+                if !self.gso.update_gso_row(kappa, end.saturating_sub(1)) {
+                    self.status = RedStatus::GsoFailure; return false;
+                }
+                need_regram = false;
+            }
+            // Snapshot stored mu / expo into scratch (true μ = stored * 2^expo).
+            for j in start..end {
+                if j >= kappa { break; }
+                let (m, e) = self.gso.get_mu_exp(kappa, j);
+                self.scratch_mu[j] = m;
+                self.scratch_expo[j] = e;
+            }
+
+            // Check the size-reduction condition on the true μ.
             let mut any_large = false;
             for j in start..end {
                 if j >= kappa { continue; }
-                let (m, e) = self.gso.get_mu_exp(kappa, j);
-                let true_mu = crate::float::ldexp(m, e as i32);
+                let true_mu = crate::float::ldexp(self.scratch_mu[j], self.scratch_expo[j] as i32);
                 if true_mu.abs() > self.eta { any_large = true; break; }
             }
-            if !any_large { return true; }
-
-            // Snapshot stored mu values with their exponents
-            let mut babai_mu = vec![0.0; end];
-            let mut babai_expo = vec![0i64; end];
-            for j in start..end {
-                if j < kappa {
-                    let (m, e) = self.gso.get_mu_exp(kappa, j);
-                    babai_mu[j] = m;
-                    babai_expo[j] = e;
-                }
+            if !any_large {
+                // If we patched (fast path only), mu/r are accurate enough. If we fell
+                // back at any step in the last pass, we already re-gramm'd above.
+                return true;
             }
 
+            // Reduce from j = kappa-1 down to start. After each reduction we:
+            //   - update our local scratch for k < j (to steer subsequent rounds),
+            //   - apply the integer op on `b[kappa]` without invalidating GSO,
+            //   - patch stored μ, r for row kappa using closed-form formulas.
             for j in (start..end).rev() {
                 if j >= kappa { continue; }
-                // Round mu stored at its native exponent. mu_m_ant = round(stored * 2^expo_bab).
-                // If expo_bab > 0 the rounded integer may overflow i64; we split: rnd_we rounds
-                // stored to integer at native precision, and the 2^expo_bab factor is emitted as expo.
-                let (q_mantissa, q_expo) = round_we(babai_mu[j], babai_expo[j]);
+                let (q_mantissa, q_expo) = round_we(self.scratch_mu[j], self.scratch_expo[j]);
                 if q_mantissa == 0 { continue; }
                 let q_true = (q_mantissa as f64) * 2f64.powi(q_expo as i32);
-                // Update remaining babai_mu to reflect b[kappa] -= q_true * b[j].
+
+                // Update scratch μ for k < j based on unchanged mu(j, k).
                 for k in start..j {
                     let (mjk, ejk) = self.gso.get_mu_exp(j, k);
                     let true_mjk = crate::float::ldexp(mjk, ejk as i32);
-                    let old_true = crate::float::ldexp(babai_mu[k], babai_expo[k] as i32);
+                    let old_true = crate::float::ldexp(self.scratch_mu[k], self.scratch_expo[k] as i32);
                     let new_true = old_true - q_true * true_mjk;
-                    babai_mu[k] = new_true; babai_expo[k] = 0;
+                    self.scratch_mu[k] = new_true;
+                    self.scratch_expo[k] = 0;
                 }
-                self.gso.row_addmul_2si(kappa, j, q_mantissa, q_expo);
+
+                // Fast path: if q fits comfortably in f64, apply the integer row op and
+                // patch μ/r in closed form. Otherwise fall back to invalidate+regram.
+                // Fast path: patch μ/r in closed form when q fits the f64 dynamic range
+                // AND the prospective patch won't obliterate small values via catastrophic
+                // cancellation. Otherwise fall back to invalidate+regram (correct, slower).
+                let q_true = (q_mantissa as f64) * 2f64.powi(q_expo as i32);
+                let f = if self.gso.enable_row_expo {
+                    2f64.powi((self.gso.row_expo[j] - self.gso.row_expo[kappa]) as i32)
+                } else { 1.0 };
+                let qf = q_true * f;
+                // Catastrophic-cancellation guard: if |qf * r[j][j]| is comparable to
+                // |r[kappa][kappa]| we lose relative precision on the diagonal. The
+                // diagonal is supposed to be invariant, but patches for r[i][k] (k<=j)
+                // can still subtract catastrophically. Fall back when the patch magnitude
+                // is large relative to the smallest surviving entry of the row.
+                let patch_large = qf.abs() > 1e12;
+                if qf.is_finite() && q_true.is_finite() && !patch_large {
+                    self.gso.row_addmul_raw(kappa, j, q_mantissa, q_expo);
+                    self.gso.patch_row_addmul(kappa, j, q_mantissa, q_expo);
+                } else {
+                    self.gso.row_addmul_2si(kappa, j, q_mantissa, q_expo);
+                    need_regram = true;
+                }
+            }
+
+            // After a full pass, reconcile row_expo drift. Small drift rescales μ/r
+            // exactly; large drift would amplify f64 error, so we force a regram.
+            match self.gso.revalidate_row_expo(kappa) {
+                crate::gso::RowExpoResult::Unchanged | crate::gso::RowExpoResult::Rescaled => {}
+                crate::gso::RowExpoResult::NeedRegram => {
+                    self.gso.invalidate_row(kappa);
+                    need_regram = true;
+                }
             }
         }
         self.status = RedStatus::BabaiFailure; false
@@ -205,11 +272,13 @@ pub fn is_lll_reduced(gso: &mut MatGso, delta: f64, eta: f64) -> bool {
         let (m, em) = gso.get_mu_exp(i, i - 1);
         let (r_prev, e_prev) = gso.get_r_exp(i - 1, i - 1);
         let (r_cur, e_cur) = gso.get_r_exp(i, i);
-        // Bring prev into scale of e_cur.
+        // Near-zero rows (linearly dependent) are allowed at the tail.
+        if r_prev.abs() < 1e-30 || r_cur.abs() < 1e-30 { continue; }
         let shift = (e_prev - e_cur) as i32;
         let r_prev_scaled = crate::float::ldexp(r_prev, shift);
         let true_mu = crate::float::ldexp(m, em as i32);
-        if r_cur + true_mu * true_mu * r_prev_scaled < delta * r_prev_scaled - 1e-9 * r_prev_scaled.abs() { return false; }
+        let slack = 1e-9 * r_prev_scaled.abs().max(r_cur.abs());
+        if r_cur + true_mu * true_mu * r_prev_scaled < delta * r_prev_scaled - slack { return false; }
     }
     true
 }

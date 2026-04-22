@@ -25,6 +25,17 @@ pub mod gso_flags {
     pub const OP_FORCE_LONG: i32 = 4;
 }
 
+/// Result of revalidating row_expo after incremental row ops.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowExpoResult {
+    /// Bit size stable; stored values are still consistent.
+    Unchanged,
+    /// Small drift; stored μ/r rescaled in place.
+    Rescaled,
+    /// Large drift; caller must invalidate+regram to preserve precision.
+    NeedRegram,
+}
+
 /// Gram-Schmidt state for an integer basis.
 pub struct MatGso {
     pub b: ZMatrix,
@@ -202,6 +213,76 @@ impl MatGso {
         for k in 0..j { self.mu[i][k] -= (xi as f64) * self.mu[j][k]; }
         // mu[i][j] is invalidated (becomes residual)
         self.invalidate_row(i);
+    }
+
+    /// Apply b[i] -= (x * 2^e) * b[j] with integer x, WITHOUT invalidating mu/r.
+    /// Caller is responsible for updating mu/r (via `patch_row_addmul`) or
+    /// invalidating manually.
+    pub fn row_addmul_raw(&mut self, i: usize, j: usize, x: i64, e: i64) {
+        if x == 0 { return; }
+        let mut xz = Z::from_i64(x);
+        xz.neg_inplace();
+        self.b.row_addmul_2si_vec(i, j, &xz, e, self.n);
+        if let Some(u) = self.u.as_mut() {
+            u.row_addmul_2si_vec(i, j, &xz, e, u.ncols());
+        }
+    }
+
+    /// Incrementally patch the stored mu/r row `i` to reflect `b[i] -= q * b[j]`
+    /// (j < i). Assumes row_expo[i] is unchanged (caller must check).
+    ///
+    /// Formulas (under ROW_EXPO; `q` is the true integer coefficient,
+    /// `q_true = q_mantissa * 2^q_expo`):
+    ///   f = 2^(row_expo[j] - row_expo[i])
+    ///   stored_mu[i][k] -= q_true * stored_mu[j][k] * f, for k < j
+    ///   stored_mu[i][j] -= q_true * f
+    ///   stored_r[i][k]  -= q_true * stored_r[j][k]  * f, for k <= j
+    ///   stored_r[i][i]  unchanged (invariant of row_addmul)
+    pub fn patch_row_addmul(&mut self, i: usize, j: usize, q_mantissa: i64, q_expo: i64) {
+        if q_mantissa == 0 { return; }
+        let q_true = (q_mantissa as f64) * 2f64.powi(q_expo as i32);
+        let f = if self.enable_row_expo {
+            2f64.powi((self.row_expo[j] - self.row_expo[i]) as i32)
+        } else { 1.0 };
+        let qf = q_true * f;
+        for k in 0..j {
+            self.mu[i][k] -= qf * self.mu[j][k];
+            self.r[i][k] -= qf * self.r[j][k];
+        }
+        self.mu[i][j] -= qf;
+        self.r[i][j] -= qf * self.r[j][j];
+        // r[i][i] is invariant; mu/r for j < k < i unchanged.
+    }
+
+    /// Re-check row_expo[i]. Small shifts rescale in place; large shifts signal
+    /// a regram is required (rescale factor would amplify accumulated f64 error).
+    pub fn revalidate_row_expo(&mut self, i: usize) -> RowExpoResult {
+        if !self.enable_row_expo { return RowExpoResult::Unchanged; }
+        let old_expo = self.row_expo[i];
+        let mut maxe: i64 = i64::MIN;
+        for j in 0..self.n {
+            let z = self.b.get(i, j);
+            if z.is_zero() { continue; }
+            let bits = z.0.significant_bits() as i64;
+            if bits > maxe { maxe = bits; }
+        }
+        let new_expo = if maxe == i64::MIN { 0 } else { maxe };
+        let drift = new_expo - old_expo;
+        if drift == 0 { return RowExpoResult::Unchanged; }
+        // Large drift: rescale would amplify f64 error > ~2^(-53+|drift|). Bail out.
+        if drift.abs() > 10 {
+            self.row_expo[i] = new_expo;
+            return RowExpoResult::NeedRegram;
+        }
+        let m_factor = 2f64.powi(-drift as i32);
+        let r_factor = m_factor * m_factor;
+        for k in 0..i {
+            self.mu[i][k] *= m_factor;
+            self.r[i][k] *= m_factor;
+        }
+        self.r[i][i] *= r_factor;
+        self.row_expo[i] = new_expo;
+        RowExpoResult::Rescaled
     }
 
     /// Apply b[i] -= (x * 2^e) * b[j] with integer x.
