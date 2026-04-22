@@ -1,0 +1,39 @@
+[package]
+name = "fplll-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["fplll-rs contributors"]
+description = "Rust port of fplll: lattice reduction (LLL, HLLL, BKZ), SVP/CVP, GSO, enumeration, pruning"
+license = "LGPL-2.1-or-later"
+repository = "https://github.com/party4bread/fplll-rs"
+
+[lib]
+name = "fplll"
+path = "src/lib.rs"
+
+[[bin]]
+name = "latticegen"
+path = "src/bin/latticegen.rs"
+
+[[bin]]
+name = "fplll"
+path = "src/bin/fplll.rs"
+
+[dependencies]
+rug = { version = "1.24", features = ["integer", "float", "rand"] }
+rayon = "1.8"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[features]
+default = []
+# Use rug::Float for arbitrary precision (slower but matches FT_MPFR semantics)
+highprec = []
